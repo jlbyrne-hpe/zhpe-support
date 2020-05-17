@@ -34,23 +34,20 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <internal.h>
+#include <zhpeq.h>
+#include <zhpeq_util.h>
 
-static void __attribute__((constructor)) backend_lib_init(void)
+static struct zhpeq_attr zhpeq_attr;
+
+int main(int argc, char **argv)
 {
-    int                 fd = -1;
-    int                 err;
+    int                 rc;
 
-    fd = open(DEV_PATH, O_RDWR);
-    if (fd == -1) {
-        err = errno;
-        print_dbg("%s,%u:open(%s) returned error %d:%s\n",
-                  __func__, __LINE__, DEV_PATH, err, strerror(err));
-    }
+    zhpeq_util_init(argv[0], LOG_INFO, false);
 
-    zhpeq_backend_libfabric_init(fd);
-    zhpeq_backend_zhpe_init(fd);
+    rc = zhpeq_init(ZHPEQ_API_VERSION, &zhpeq_attr);
+    if (rc < 0)
+        print_func_err(__func__, __LINE__, "zhpeq_init", "", rc);
 
-    if (fd != -1)
-        close(fd);
+    return 0;
 }

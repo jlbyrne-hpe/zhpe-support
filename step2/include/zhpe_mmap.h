@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017-2018 Hewlett Packard Enterprise Development LP.
+ * Copyright (C) 2019 Hewlett Packard Enterprise Development LP.
  * All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -34,23 +34,20 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <internal.h>
+#ifndef _ZHPE_MMAP_H_
+#define _ZHPE_MMAP_H_
 
-static void __attribute__((constructor)) backend_lib_init(void)
-{
-    int                 fd = -1;
-    int                 err;
+#include <stdbool.h>
+#include <stdint.h>
+#include <zhpeq_util_fab.h>
+#include <rdma/fi_ext_zhpe.h>
+#include <rdma/fabric.h>
 
-    fd = open(DEV_PATH, O_RDWR);
-    if (fd == -1) {
-        err = errno;
-        print_dbg("%s,%u:open(%s) returned error %d:%s\n",
-                  __func__, __LINE__, DEV_PATH, err, strerror(err));
-    }
+_EXTERN_C_BEG
 
-    zhpeq_backend_libfabric_init(fd);
-    zhpeq_backend_zhpe_init(fd);
+void * zhpe_mmap_alloc(size_t length);
+int zhpe_munmap_free(void *buf);
 
-    if (fd != -1)
-        close(fd);
-}
+_EXTERN_C_END
+
+#endif /* _ZHPE_MMAP_H_ */
