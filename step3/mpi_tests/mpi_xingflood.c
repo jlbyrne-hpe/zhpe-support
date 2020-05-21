@@ -98,6 +98,7 @@ struct rankdata {
     uint64_t            run_nsec;
     struct timespec     start_time;
     uint64_t            ops_completed;
+    int                 slice;
 };
 
 struct rundata {
@@ -106,7 +107,8 @@ struct rundata {
 };
 
 static void print_rankdata_nonzero(struct timespec *start_time,
-                                   uint64_t run_cyc, uint64_t ops_completed)
+                                   uint64_t run_cyc, uint64_t ops_completed,
+                                   int slice)
 {
     struct rankdata     rd_self;
 
@@ -115,6 +117,7 @@ static void print_rankdata_nonzero(struct timespec *start_time,
     rd_self.start_time  = *start_time;
     rd_self.run_nsec = cycles_to_nsec(run_cyc);
     rd_self.ops_completed = ops_completed;
+    rd_self.slice = slice;
 
     /* Lazy about structs. */
     MPI_CALL(MPI_Gather, &rd_self, sizeof(rd_self), MPI_BYTE,
@@ -176,9 +179,10 @@ static void print_rankdata_zero(const struct args *args, struct rundata *run)
         run_usec =  (double)rd[i].run_nsec / 1000.0;
         mops = (double)rd[i].ops_completed / run_usec;
         printf("rank:%3d; start skew:%10.3f; run time:%12.3f; end skew:%10.3lf;"
-               " ops:%10" PRIu64 "; Mops/s:%10.3f\n",
+               " ops:%10" PRIu64 "; Mops/s:%10.3f; slice:%d\n",
                i, (double)start_delta / 1000.0, run_usec,
-               (double)end_delta / 1000.0, rd[i].ops_completed, mops);
+               (double)end_delta / 1000.0, rd[i].ops_completed, mops,
+               rd[i].slice);
         run->mops += mops;
     }
     run->skew = (double)max_skew / 1000.0;
@@ -389,7 +393,8 @@ static int do_client_unidir(struct stuff *conn)
     run_cyc = get_cycles(NULL) - start_cyc;
 
     MPI_CALL(MPI_Barrier, MPI_COMM_WORLD);
-    print_rankdata_nonzero(&start_time, run_cyc, conn->ops_completed);
+    print_rankdata_nonzero(&start_time, run_cyc, conn->ops_completed,
+                           conn->args->slice);
 
     return 0;
 }
