@@ -116,7 +116,7 @@ static void print_rankdata_nonzero(struct timespec *start_time,
     rd_self.start_time  = *start_time;
     rd_self.run_nsec = cycles_to_nsec(run_cyc);
     rd_self.ops_completed = conn->ops_completed;
-    rd_self.slice = conn->args->slice;
+    rd_self.slice = conn->ztq->tqinfo.slice;
 
     /* Lazy about structs. */
     MPI_CALL(MPI_Gather, &rd_self, sizeof(rd_self), MPI_BYTE,
