@@ -9,6 +9,9 @@ target_link_libraries(enqapong PUBLIC zhpeq zhpeq_util)
 add_executable(enqatest enqatest.c)
 target_link_libraries(enqatest PUBLIC zhpeq zhpeq_util)
 
+add_executable(ion_bw ion_bw.c)
+target_link_libraries(ion_bw PUBLIC zhpeq zhpeq_util)
+
 add_executable(libzhpeq_ld libzhpeq_ld.c)
 target_link_libraries(libzhpeq_ld PUBLIC zhpeq zhpeq_util)
 
@@ -44,6 +47,7 @@ install(
   edgetest
   enqapong
   enqatest
+  ion_bw
   libzhpeq_ld
   libzhpeq_zaddr
   libzhpeq_mr
