@@ -45,13 +45,13 @@ enum z_op_types {
 /* global variables */
 static struct zhpeq_attr zhpeq_attr;
 
-// TODO: Is it okay to use ring_xfer_len for msg size?
 struct args {
     int                 argc;
     char                **argv;
     uint64_t            ring_xfer_len;
     uint64_t            ring_entries;
     uint64_t            runs;
+    uint64_t            qlen;
     uint32_t            gcid;
     int                 slice;
     enum z_op_types     op_type;
@@ -64,11 +64,11 @@ struct stuff {
     size_t                  ring_xfer_aligned;
     size_t                  ring_len;
     uint32_t                cmdq_entries[2];
+    int32_t                 *reservations[2];
     void                    *local_buf[2];
     size_t                  local_len[2];
     struct zhpeq_key_data   *qkdata[2];
     struct zhpeq_key_data   *local_kdata[2];
-
     struct zhpeq_tq         *ztq[2];
     void                    *addr_cookie;
 };
@@ -82,6 +82,7 @@ static void stuff_free(struct stuff *stuff)
 
     if (stuff->addr_cookie)
         zhpeq_domain_remove_addr(stuff->zqdom, stuff->addr_cookie);
+
     for ( i=0;i<2;i++ ) {
         zhpeq_qkdata_free(stuff->local_kdata[i]);
 
@@ -123,17 +124,15 @@ static int ztq_completions(struct zhpeq_tq *ztq)
 
 
 /* Advance ztq->wq_tail_commit by cnt and write it */
-/* Do not check avail. */
-static void ztq_write(struct zhpeq_tq *ztq, int cnt)
+/* For his test, do not check avail. */
+static void ztq_start(struct zhpeq_tq *ztq, int32_t *reservations, uint64_t cnt)
 {
-    uint32_t            qmask;
-
-    qmask = ztq->tqinfo.cmdq.ent - 1;
-
-    ztq->wq_tail_commit += cnt;
-    qcmwrite64(ztq->wq_tail_commit & qmask,
-               ztq->qcm, ZHPE_XDM_QCM_CMD_QUEUE_TAIL_OFFSET);
+    int i;
+    for (i = 0; i < cnt; i++)
+        zhpeq_tq_insert(ztq, reservations[i]);
+    zhpeq_tq_commit(ztq);
 }
+
 
 
 /* Use existing pre-populated command buffer. */
@@ -141,23 +140,22 @@ static int do_client_unidir(struct stuff *conn)
 {
     uint64_t            start_cyc;
     uint64_t            stop_cyc;
-    struct timespec     start_time;
     uint64_t            elapsed;
     int                 count0=0;
     int                 count1=0;
-
-    clock_gettime(CLOCK_REALTIME, &start_time);
+    uint64_t            ring_entries = conn->args->ring_entries;
 
     start_cyc = get_cycles(NULL);
 
-    ztq_write(conn->ztq[0],3);
-    ztq_write(conn->ztq[1],3);
+    ztq_start(conn->ztq[0], conn->reservations[0], ring_entries );
+    ztq_start(conn->ztq[1], conn->reservations[1], ring_entries);
 
     // could loop the following
-    while ((count0 < 3 ) || (count1 < 3)) {
+    while ((count0 < ring_entries) || (count1 < ring_entries)) {
        count0 += ztq_completions(conn->ztq[0]);
        count1 += ztq_completions(conn->ztq[1]);
     }
+
     stop_cyc = get_cycles(NULL);
     elapsed=(stop_cyc - start_cyc);
 
@@ -185,68 +183,79 @@ static int do_mem_setup(struct stuff *conn)
     /* prepare to set up one ring per tq */
     conn->ring_xfer_aligned = l1_up(args->ring_xfer_len);
 
-    if (args->ring_xfer_len > ZHPEQ_MAX_IMM) {
-        for ( i=0;i<2;i++ ) {
-            /* should be true but will check anyway, for possible future */
-            conn->ring_len = conn->ring_xfer_aligned * conn->cmdq_entries[i];
-            conn->local_len[i] = conn->ring_len;
+    /* always true at this time but will check anyway, for possible future */
+    for ( i=0;i<2;i++ ) {
+        conn->ring_len = conn->ring_xfer_aligned * conn->cmdq_entries[i];
+        conn->local_len[i] = conn->ring_len;
 
-            conn->local_buf[i] = _zhpeu_mmap(NULL, conn->local_len[i],
-                                          PROT_READ | PROT_WRITE,
-                                          MAP_ANONYMOUS | MAP_SHARED, -1 , 0);
+        conn->local_buf[i] = _zhpeu_mmap(NULL, conn->local_len[i],
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_ANONYMOUS | MAP_SHARED, -1 , 0);
 
-            ret = zhpeq_mr_reg(conn->zqdom, conn->local_buf[i], conn->local_len[i],
-                               (ZHPEQ_MR_GET | ZHPEQ_MR_PUT |
-                                ZHPEQ_MR_GET_REMOTE | ZHPEQ_MR_PUT_REMOTE),
-                               &conn->local_kdata[i]);
+        ret = zhpeq_mr_reg(conn->zqdom, conn->local_buf[i], conn->local_len[i],
+                           (ZHPEQ_MR_GET | ZHPEQ_MR_PUT |
+                            ZHPEQ_MR_GET_REMOTE | ZHPEQ_MR_PUT_REMOTE),
+                           &conn->local_kdata[i]);
+        if (ret < 0) {
+            print_func_err(__func__, __LINE__, "zhpeq_mr_reg", "", ret);
+            goto done;
+        }
+
+        /* do_fam_setup did export/import/zhpeq_zmmu_reg of remote mem */
+
+        remote_zaddr = conn->qkdata[i]->z.zaddr;
+
+        /* allocate reservations */
+        conn->reservations[i]=calloc(conn->args->ring_entries, sizeof(uint32_t));
+        /* Loop and fill in all commmand buffers. */
+        for ( j = 0, cmd_off = 0; j < conn->args->ring_entries;
+              j++, cmd_off += conn->ring_xfer_aligned) {
+
+            // reserve a command buffer
+            ret = zhpeq_tq_reserve(conn->ztq[i]);
             if (ret < 0) {
-                print_func_err(__func__, __LINE__, "zhpeq_mr_reg", "", ret);
+                print_func_err(__func__, __LINE__, "zhpeq_tq_reserve", "", ret);
                 goto done;
             }
+            conn->reservations[i][j]=ret;
 
-            /* do_fam_setup did export/import/zhpeq_zmmu_reg of remote mem */
+            // wqe is in a buffer in the mem[] array in the queue
+            // as opposed to in the queue or the command buffer
+            wqe = zhpeq_tq_get_wqe(conn->ztq[i], ret);
 
-            /* hard-coded to do this only three times */
-            /* Loop and fill in all commmand buffers. */
-            for ( j = 0, cmd_off = 0; j < 3;
-                  j++, cmd_off += conn->ring_xfer_aligned) {
+            wqe->hdr.cmp_index = i;
+            switch (args->op_type) {
 
-                remote_zaddr = conn->qkdata[i]->z.zaddr;
-                wqe = zhpeq_tq_get_wqe(conn->ztq[i], ret);
-                wqe->hdr.cmp_index = i;
+            case ZGET:
+                if (args->ring_xfer_len <= ZHPEQ_MAX_IMM)
+                    zhpeq_tq_geti(wqe, 0, args->ring_xfer_len,
+                                  remote_zaddr + cmd_off);
+                else
+                    zhpeq_tq_get(wqe, 0,
+                                 (uintptr_t)conn->local_buf[i] + cmd_off,
+                                 args->ring_xfer_len,
+                                 remote_zaddr + cmd_off);
+            break;
 
-                switch (args->op_type) {
-
-                case ZGET:
-                    if (args->ring_xfer_len <= ZHPEQ_MAX_IMM)
-                        zhpeq_tq_geti(wqe, 0, args->ring_xfer_len,
-                                      remote_zaddr + cmd_off);
-                    else
-                        zhpeq_tq_get(wqe, 0,
-                                     (uintptr_t)conn->local_buf[i] + cmd_off,
-                                     args->ring_xfer_len,
-                                     remote_zaddr + cmd_off);
+            case ZPUT:
+                if (args->ring_xfer_len <= ZHPEQ_MAX_IMM)
+                    memset(zhpeq_tq_puti(wqe, 0, args->ring_xfer_len,
+                                         remote_zaddr + cmd_off),
+                                         0, args->ring_xfer_len);
+                else
+                    zhpeq_tq_put(wqe, 0,
+                                 (uintptr_t)conn->local_buf + cmd_off,
+                                  args->ring_xfer_len,
+                                  remote_zaddr + cmd_off);
                 break;
 
-                case ZPUT:
-                    if (args->ring_xfer_len <= ZHPEQ_MAX_IMM)
-                        memset(zhpeq_tq_puti(wqe, 0, args->ring_xfer_len,
-                                             remote_zaddr + cmd_off),
-                                             0, args->ring_xfer_len);
-                    else
-                        zhpeq_tq_put(wqe, 0,
-                                     (uintptr_t)conn->local_buf + cmd_off,
-                                      args->ring_xfer_len,
-                                      remote_zaddr + cmd_off);
-                    break;
-
-                default:
-                    ret = -EINVAL;
-                    break;
-                }
+            default:
+                ret = -EINVAL;
+                break;
             }
         }
     }
+    ret=0;
  done:
     return ret;
 }
@@ -254,7 +263,7 @@ static int do_mem_setup(struct stuff *conn)
 /* Set up remote address for the FAM memory and insert into the conn->zqdom */
 /* Do this one time. */
 /* Use zhpeq_fam_qkdata to get zhpeq_key_data for two regions. */
-/* zhpeq_fam_qkdata sets length to be as large as possible for platform. */
+/* zhpeq_fam_qkdata sets length to be as large as possible for platform? */
 /* At the end of this, the remote memory will be registered. */
 static int do_fam_setup(struct stuff *conn)
 {
@@ -266,7 +275,7 @@ static int do_fam_setup(struct stuff *conn)
     uint                    gcid = conn->args->gcid;
     int                     ret=-1;
 
-    /* do we need to save the sz ? */
+    /* TODO: save the sz and then free it? */
     sz = malloc(sizeof(struct sockaddr_zhpe));
 
     memset(sz, 0, sizeof(*sz));
@@ -276,7 +285,7 @@ static int do_fam_setup(struct stuff *conn)
 
     /* Comment said that zctx_lock() must be held. */
     /* TODO: how to set zctx ? Get it from fid?
-     *       Comment out fastlock for now */
+     *       Comment out fastlock for now because we're single-threaded */
     //    fastlock_acquire(conn->zctx->util_ep.lock);
     rc = zhpeq_domain_insert_addr(conn->zqdom, sz, &conn->addr_cookie);
      //   fastlock_release(conn->zctx->util_ep.lock);
@@ -364,18 +373,6 @@ static int do_queue_setup(struct stuff *conn)
     return ret;
 }
 
-/*
-set up FAM
-set up two xdm queues
-reserve three slots on each queue
- look at xingpong: 3 reserves (get wqes), 3 puts (fill in wqes), 3 inserts, single commit
-fill in the wqe's
-queue up three 128MB Get/Put operations on each queues
-start a timer
-submit the operations commit on both queues
-poll for completions
-stop the timer when complete
-*/
 static int do_client(const struct args *args)
 {
     int                 ret;
@@ -421,8 +418,6 @@ static void usage(bool help)
 
 
 /* Take gcid and operation types as input parameters. */
-/* Maybe later take number of iterations? */
-/* TODO: sanity check ring_xfer_len with John. */
 int main(int argc, char **argv)
 {
     int                 ret = 1;
@@ -502,7 +497,7 @@ int main(int argc, char **argv)
         args.ring_xfer_len = 0x8000000;
 
     /*
-     * We only have three entries.
+     * For now, hard-code to three entries.
      */
     args.ring_entries = 3;
 
