@@ -66,7 +66,6 @@ struct stuff {
     uint32_t                cmdq_entries[2];
     int32_t                 *reservations[2];
     void                    *local_buf[2];
-    size_t                  local_len[2];
     struct zhpeq_key_data   *qkdata[2];
     struct zhpeq_key_data   *local_kdata[2];
     struct zhpeq_tq         *ztq[2];
@@ -93,7 +92,7 @@ static void stuff_free(struct stuff *stuff)
 
     for ( i=0;i<2;i++ ) {
         if (stuff->local_buf[i])
-            munmap(stuff->local_buf[i], stuff->local_len[i]);
+            munmap(stuff->local_buf[i], stuff->ring_xfer_aligned);
     }
 }
 
@@ -124,7 +123,7 @@ static int ztq_completions(struct zhpeq_tq *ztq)
 
 
 /* Advance ztq->wq_tail_commit by cnt and write it */
-/* For his test, do not check avail. */
+/* For this test, do not check avail. */
 static void ztq_start(struct zhpeq_tq *ztq, int32_t *reservations, uint64_t cnt)
 {
     int i;
@@ -166,13 +165,12 @@ static int do_client_unidir(struct stuff *conn)
 }
 
 
-/* Allocate memory to store two buffers that can each hold */
-/* three 128 MB regions of memory to be used for get/put operations*/
+/* Allocate memory to store two buffers that can each hold       */
+/* one 128 MB region of memory to be used for get/put operations */
 static int do_mem_setup(struct stuff *conn)
 {
     int                 ret;
     uint64_t            remote_zaddr;
-    size_t              cmd_off;
 
     const struct args   *args = conn->args;
     union zhpe_hw_wq_entry *wqe;
@@ -183,16 +181,12 @@ static int do_mem_setup(struct stuff *conn)
     /* prepare to set up one ring per tq */
     conn->ring_xfer_aligned = l1_up(args->ring_xfer_len);
 
-    /* always true at this time but will check anyway, for possible future */
     for ( i=0;i<2;i++ ) {
-        conn->ring_len = conn->ring_xfer_aligned * conn->cmdq_entries[i];
-        conn->local_len[i] = conn->ring_len;
-
-        conn->local_buf[i] = _zhpeu_mmap(NULL, conn->local_len[i],
+        conn->local_buf[i] = _zhpeu_mmap(NULL, conn->ring_xfer_aligned,
                                          PROT_READ | PROT_WRITE,
                                          MAP_ANONYMOUS | MAP_SHARED, -1 , 0);
 
-        ret = zhpeq_mr_reg(conn->zqdom, conn->local_buf[i], conn->local_len[i],
+        ret = zhpeq_mr_reg(conn->zqdom, conn->local_buf[i], conn->ring_xfer_aligned,
                            (ZHPEQ_MR_GET | ZHPEQ_MR_PUT |
                             ZHPEQ_MR_GET_REMOTE | ZHPEQ_MR_PUT_REMOTE),
                            &conn->local_kdata[i]);
@@ -207,9 +201,9 @@ static int do_mem_setup(struct stuff *conn)
 
         /* allocate reservations */
         conn->reservations[i]=calloc(conn->args->ring_entries, sizeof(uint32_t));
+
         /* Loop and fill in all commmand buffers. */
-        for ( j = 0, cmd_off = 0; j < conn->args->ring_entries;
-              j++, cmd_off += conn->ring_xfer_aligned) {
+        for ( j = 0; j < conn->args->ring_entries; j++ ) {
 
             // reserve a command buffer
             ret = zhpeq_tq_reserve(conn->ztq[i]);
@@ -223,30 +217,29 @@ static int do_mem_setup(struct stuff *conn)
             // as opposed to in the queue or the command buffer
             wqe = zhpeq_tq_get_wqe(conn->ztq[i], ret);
 
-            wqe->hdr.cmp_index = i;
             switch (args->op_type) {
 
             case ZGET:
                 if (args->ring_xfer_len <= ZHPEQ_MAX_IMM)
                     zhpeq_tq_geti(wqe, 0, args->ring_xfer_len,
-                                  remote_zaddr + cmd_off);
+                                  remote_zaddr);
                 else
                     zhpeq_tq_get(wqe, 0,
-                                 (uintptr_t)conn->local_buf[i] + cmd_off,
+                                 (uintptr_t)conn->local_buf[i],
                                  args->ring_xfer_len,
-                                 remote_zaddr + cmd_off);
+                                 remote_zaddr);
             break;
 
             case ZPUT:
                 if (args->ring_xfer_len <= ZHPEQ_MAX_IMM)
                     memset(zhpeq_tq_puti(wqe, 0, args->ring_xfer_len,
-                                         remote_zaddr + cmd_off),
+                                         remote_zaddr),
                                          0, args->ring_xfer_len);
                 else
                     zhpeq_tq_put(wqe, 0,
-                                 (uintptr_t)conn->local_buf + cmd_off,
+                                 (uintptr_t)conn->local_buf,
                                   args->ring_xfer_len,
-                                  remote_zaddr + cmd_off);
+                                  remote_zaddr);
                 break;
 
             default:
